@@ -38,6 +38,7 @@ SecretSpec fixes this by separating secret **declaration** from secret **storage
   - [Proton Pass](https://secretspec.dev/providers/protonpass)
   - [Passbolt](https://secretspec.dev/providers/passbolt) (0.19+)
   - [environment variables](https://secretspec.dev/providers/env)
+  - [Doppler](https://secretspec.dev/providers/doppler) (0.20+)
   - [null](https://secretspec.dev/providers/null) (0.19+)
   - [systemd credentials](https://secretspec.dev/providers/systemd-credential) (0.17+)
   - [Fly.io application secrets](https://secretspec.dev/providers/fly) (0.20+, write-only)
@@ -90,6 +91,7 @@ $ secretspec config global init  # 0.17+
   dotenv: Traditional .env files
   file: Plaintext files, one per secret (0.19+)
   env: Read-only environment variables
+  doppler: Doppler secrets manager via the Doppler CLI (0.20+)
   null: Use defaults, generation, or run prompts without storage (0.19+)
   systemd-credential: Read-only systemd service credentials (0.17+)
   fly: Fly.io application secrets via flyctl, write-only (0.20+)
@@ -215,6 +217,7 @@ SecretSpec supports multiple storage backends for secrets:
 - **[.env files](https://secretspec.dev/providers/dotenv)** - Traditional dotenv files
 - **[Plaintext files](https://secretspec.dev/providers/file)** (0.19+) - One UTF-8 file per secret in a local directory tree
 - **[Environment variables](https://secretspec.dev/providers/env)** - Read-only for CI/CD
+- **[Doppler](https://secretspec.dev/providers/doppler)** (0.20+) - Project/config-scoped secrets through the Doppler CLI
 - **[Null](https://secretspec.dev/providers/null)** (0.19+) - Use committed defaults, ephemeral generation, or ephemeral run prompts without secret storage
 - **[systemd credentials](https://secretspec.dev/providers/systemd-credential)** (0.17+) - Read-only credentials passed to the current service
 - **[Fly.io application secrets](https://secretspec.dev/providers/fly)** (0.20+) - Write and delete app secrets through `flyctl`; Fly.io does not expose plaintext values

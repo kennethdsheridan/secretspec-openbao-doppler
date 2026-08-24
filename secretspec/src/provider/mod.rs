@@ -19,6 +19,7 @@
 //! - [`kdbx::KdbxProvider`]: KeePass KDBX database integration (0.17+)
 //! - [`keeper::KeeperProvider`]: Keeper Secrets Manager integration (0.18+)
 //! - [`dotenv::DotEnvProvider`]: `.env` file support
+//! - [`doppler::DopplerProvider`]: Doppler secrets manager integration (0.20+)
 //! - [`env::EnvProvider`]: Environment variables (read-only)
 //! - [`null::NullProvider`]: Defaults, generation, or run prompts without storage (0.19+)
 //! - [`file::FileProvider`]: Plaintext file-per-secret storage (0.19+)
@@ -160,6 +161,7 @@ pub mod bws;
 #[cfg(feature = "cloudflare")]
 pub mod cloudflare;
 pub mod dashlane;
+pub mod doppler;
 pub mod dotenv;
 pub mod env;
 pub mod file;

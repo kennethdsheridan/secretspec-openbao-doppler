@@ -1,0 +1,83 @@
+---
+title: Doppler provider
+description: Read and write secrets in a Doppler project config
+---
+
+import ProviderCredentials from '../../../components/ProviderCredentials.astro';
+
+:::caution[Version compatibility]
+The Doppler provider is available in SecretSpec 0.20 and later.
+:::
+
+Use the Doppler provider to read, write, and discover secrets through the
+authenticated [`doppler` CLI](https://docs.doppler.com/docs/cli).
+
+## Set up Doppler
+
+Install the Doppler CLI using your platform's package manager, then authenticate:
+
+```bash
+doppler login
+```
+
+For CI, provide a scoped service token instead:
+
+```bash
+export DOPPLER_TOKEN=dp.st.example
+```
+
+An alias can resolve the token through SecretSpec instead. Its `access_token`
+credential takes precedence over `DOPPLER_TOKEN`:
+
+```toml title="secretspec.toml"
+[providers]
+bootstrap = "keyring://"
+production = { uri = "doppler://my-app/prd", credentials = { access_token = "bootstrap" } }
+```
+
+Set `SECRETSPEC_DOPPLER_CLI_PATH` to use a Doppler binary outside `PATH`.
+
+## Provider credentials
+
+<ProviderCredentials provider="doppler" />
+
+## Configure a project and config
+
+The URI is `doppler://PROJECT/CONFIG`:
+
+```toml title="secretspec.toml"
+[providers]
+development = "doppler://my-app/dev"
+production = "doppler://my-app/prd"
+```
+
+Use an alias for the active environment:
+
+```bash
+secretspec set API_KEY --provider development
+secretspec check --provider production
+secretspec run --provider production -- npm start
+```
+
+## Storage and references
+
+Doppler's selected project/config is the whole storage namespace. SecretSpec
+stores a convention secret directly as `{key}`; it does not prefix the key with
+the SecretSpec project or profile. This makes the URI, rather than the profile,
+responsible for environment isolation.
+
+Use `ref.item` to read an existing Doppler key:
+
+```toml title="secretspec.toml"
+[profiles.production]
+DATABASE_URL = { description = "Production database", ref = { item = "DATABASE_URL" } }
+```
+
+`secretspec init --from doppler://my-app/dev` discovers the keys in that
+project/config. Doppler metadata keys beginning with `DOPPLER_` are excluded.
+
+## Security
+
+SecretSpec passes values to the Doppler CLI on standard input so they do not
+appear in process arguments. Keep `DOPPLER_TOKEN` in CI secret storage rather
+than a provider URI; SecretSpec rejects credentials embedded in provider URIs.
