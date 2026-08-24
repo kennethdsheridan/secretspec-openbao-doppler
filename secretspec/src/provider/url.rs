@@ -85,15 +85,12 @@ impl ProviderUrl {
             .into_owned()
     }
 
-    #[cfg(any(
-        feature = "aac",
-        feature = "infisical",
-        feature = "openbao",
-        feature = "vault",
-        test
-    ))]
     pub fn port(&self) -> Option<u16> {
         self.0.port()
+    }
+
+    pub(crate) fn fragment(&self) -> Option<&str> {
+        self.0.fragment()
     }
 
     pub fn query_pairs(&self) -> url::form_urlencoded::Parse<'_> {

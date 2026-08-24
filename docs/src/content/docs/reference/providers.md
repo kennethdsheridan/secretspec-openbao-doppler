@@ -57,6 +57,29 @@ env://                       # Current process environment
 
 **Features**: Read-only, no setup required, no persistence
 
+## Doppler Provider (0.20+)
+
+:::caution[Version compatibility]
+The `doppler` provider is added in SecretSpec 0.20.
+:::
+
+**URI**: `doppler://PROJECT/CONFIG` - Stores flat secret names in one Doppler
+project and config
+
+```text
+doppler://my-app/dev          # Development config
+doppler://my-app/stg          # Staging config
+doppler://my-app/prd          # Production config
+```
+
+**Features**: Read/write, batch retrieval, declaration discovery, team access
+controls, and audit logs
+**Prerequisites**: The `doppler` CLI, an authenticated `doppler login` session
+or `DOPPLER_TOKEN`, and access to the selected project and config
+**Storage**: Secret key `{key}`. The URI supplies project and environment
+isolation, so SecretSpec's project and profile are not included in the Doppler
+key. A `ref.item` selects an existing Doppler key.
+
 ## Null Provider (0.19+)
 
 :::caution[Version compatibility]
