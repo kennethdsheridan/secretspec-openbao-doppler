@@ -159,6 +159,18 @@ openbao://[namespace@]host[:port][/mount][?key=value&...]
 - `?audience=`: Audience requested from the CI OIDC issuer
 - `?kv=1`: Use KV v1 (default: v2)
 - `?tls=false`: Disable TLS for development servers
+- `?ca_cert_path=` (0.20+): PEM custom CA file. It augments system trust.
+- `?ca_cert_data=` (0.20+): Percent-encoded PEM custom CA data. Use `ca_cert_path`
+  when a file is practical.
+- `?spki_pin=` (0.20+): Percent-encoded, base64-encoded SHA-256 digest of the
+  server certificate's SPKI. The normal certificate chain and hostname checks
+  still apply.
+- `?client_cert_path=` and `?client_key_path=` (0.20+): PEM client certificate and key
+  paths for mTLS. Both are required; do not put private-key data in a URI.
+
+These TLS extensions require the default `tls=true`; SecretSpec rejects them with
+`tls=false`. TLS configuration is not included in the canonical provider URI,
+so certificate data and client-key paths do not appear in diagnostics.
 
 ### Concurrent resolution
 
@@ -178,6 +190,9 @@ openbao://bao.example.com:8200/secret?auth=approle&auth_mount=platform-approle
 openbao://bao.example.com:8200/secret?auth=jwt&role=ci
 # SecretSpec 0.18+, with default_role configured on the JWT auth mount
 openbao://bao.example.com:8200/secret?auth=jwt
+# SecretSpec 0.20+
+openbao://bao.example.com:8200/secret?ca_cert_path=%2Fetc%2Fopenbao%2Fca.pem&spki_pin=BASE64_SHA256_SPKI
+openbao://bao.example.com:8200/secret?client_cert_path=%2Fetc%2Fopenbao%2Fclient.pem&client_key_path=%2Fetc%2Fopenbao%2Fclient-key.pem
 ```
 
 ### Project configuration

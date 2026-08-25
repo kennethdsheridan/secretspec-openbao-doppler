@@ -11,15 +11,263 @@ use reqwest::header::{HeaderMap, HeaderValue};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
+#[cfg(feature = "openbao")]
+use std::fs;
+#[cfg(feature = "openbao")]
+use std::io::BufReader;
 use std::path::PathBuf;
+#[cfg(feature = "openbao")]
+use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use url::Url;
 
+#[cfg(feature = "openbao")]
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+#[cfg(feature = "openbao")]
+use rustls::client::WebPkiServerVerifier;
+#[cfg(feature = "openbao")]
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+#[cfg(feature = "openbao")]
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+#[cfg(feature = "openbao")]
+use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme};
+#[cfg(feature = "openbao")]
+use sha2::{Digest, Sha256};
+#[cfg(feature = "openbao")]
+use x509_parser::prelude::FromDer;
+
 pub(crate) const ROLE_ID: &str = "role_id";
 pub(crate) const SECRET_ID: &str = "secret_id";
 pub(crate) const TOKEN: &str = "token";
+
+/// OpenBao-specific TLS inputs. These are intentionally absent from Vault's
+/// compatible configuration contract.
+#[cfg(feature = "openbao")]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct OpenBaoTlsConfig {
+    ca_cert_path: Option<PathBuf>,
+    ca_cert_pem: Option<String>,
+    spki_pin: Option<Vec<u8>>,
+    client_cert_path: Option<PathBuf>,
+    client_key_path: Option<PathBuf>,
+}
+
+#[cfg(feature = "openbao")]
+impl OpenBaoTlsConfig {
+    fn is_configured(&self) -> bool {
+        self.ca_cert_path.is_some()
+            || self.ca_cert_pem.is_some()
+            || self.spki_pin.is_some()
+            || self.client_cert_path.is_some()
+    }
+
+    fn parse(url: &ProviderUrl, use_tls: bool) -> Result<Self> {
+        let ca_cert_path = url.query_value("ca_cert_path").map(PathBuf::from);
+        let ca_cert_pem = url.query_value("ca_cert_data");
+        if ca_cert_path.is_some() && ca_cert_pem.is_some() {
+            return Err(SecretSpecError::ProviderOperationFailed(
+                "Specify only one of `ca_cert_path` or `ca_cert_data` for OpenBao TLS".to_string(),
+            ));
+        }
+
+        let spki_pin = url
+            .query_value("spki_pin")
+            .map(|pin| {
+                let decoded = STANDARD.decode(pin.as_bytes()).map_err(|error| {
+                    SecretSpecError::ProviderOperationFailed(format!(
+                        "Invalid OpenBao `spki_pin`: expected a base64-encoded SHA-256 digest: {error}"
+                    ))
+                })?;
+                if decoded.len() != 32 {
+                    return Err(SecretSpecError::ProviderOperationFailed(
+                        "Invalid OpenBao `spki_pin`: expected a base64-encoded 32-byte SHA-256 digest"
+                            .to_string(),
+                    ));
+                }
+                Ok(decoded)
+            })
+            .transpose()?;
+
+        let client_cert_path = url.query_value("client_cert_path").map(PathBuf::from);
+        let client_key_path = url.query_value("client_key_path").map(PathBuf::from);
+        if client_cert_path.is_some() != client_key_path.is_some() {
+            return Err(SecretSpecError::ProviderOperationFailed(
+                "OpenBao mTLS requires both `client_cert_path` and `client_key_path`".to_string(),
+            ));
+        }
+
+        let config = Self {
+            ca_cert_path,
+            ca_cert_pem,
+            spki_pin,
+            client_cert_path,
+            client_key_path,
+        };
+        if !use_tls && config.is_configured() {
+            return Err(SecretSpecError::ProviderOperationFailed(
+                "OpenBao TLS options require TLS; remove `tls=false`".to_string(),
+            ));
+        }
+        Ok(config)
+    }
+
+    fn ca_pem(&self) -> Result<Option<Vec<u8>>> {
+        match (&self.ca_cert_path, &self.ca_cert_pem) {
+            (Some(path), None) => fs::read(path).map(Some).map_err(|error| {
+                SecretSpecError::ProviderOperationFailed(format!(
+                    "Failed to read OpenBao CA certificate '{}': {error}",
+                    path.display()
+                ))
+            }),
+            (None, Some(pem)) => Ok(Some(pem.as_bytes().to_vec())),
+            (None, None) => Ok(None),
+            (Some(_), Some(_)) => {
+                unreachable!("OpenBao TLS configuration is validated when parsed")
+            }
+        }
+    }
+
+    fn client_identity_pem(&self) -> Result<Option<Vec<u8>>> {
+        let (Some(cert_path), Some(key_path)) = (&self.client_cert_path, &self.client_key_path)
+        else {
+            return Ok(None);
+        };
+        let mut identity = fs::read(cert_path).map_err(|error| {
+            SecretSpecError::ProviderOperationFailed(format!(
+                "Failed to read OpenBao client certificate '{}': {error}",
+                cert_path.display()
+            ))
+        })?;
+        identity.push(b'\n');
+        identity.extend(fs::read(key_path).map_err(|error| {
+            SecretSpecError::ProviderOperationFailed(format!(
+                "Failed to read OpenBao client key '{}': {error}",
+                key_path.display()
+            ))
+        })?);
+        Ok(Some(identity))
+    }
+
+    fn client_identity(
+        &self,
+    ) -> Result<
+        Option<(
+            Vec<CertificateDer<'static>>,
+            rustls::pki_types::PrivateKeyDer<'static>,
+        )>,
+    > {
+        let (Some(cert_path), Some(key_path)) = (&self.client_cert_path, &self.client_key_path)
+        else {
+            return Ok(None);
+        };
+        let cert_file = fs::File::open(cert_path).map_err(|error| {
+            SecretSpecError::ProviderOperationFailed(format!(
+                "Failed to read OpenBao client certificate '{}': {error}",
+                cert_path.display()
+            ))
+        })?;
+        let certificates = rustls_pemfile::certs(&mut BufReader::new(cert_file))
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|error| {
+                SecretSpecError::ProviderOperationFailed(format!(
+                    "Failed to parse OpenBao client certificate '{}': {error}",
+                    cert_path.display()
+                ))
+            })?;
+        if certificates.is_empty() {
+            return Err(SecretSpecError::ProviderOperationFailed(format!(
+                "OpenBao client certificate '{}' contains no certificates",
+                cert_path.display()
+            )));
+        }
+        let key_file = fs::File::open(key_path).map_err(|error| {
+            SecretSpecError::ProviderOperationFailed(format!(
+                "Failed to read OpenBao client key '{}': {error}",
+                key_path.display()
+            ))
+        })?;
+        let key = rustls_pemfile::private_key(&mut BufReader::new(key_file))
+            .map_err(|error| {
+                SecretSpecError::ProviderOperationFailed(format!(
+                    "Failed to parse OpenBao client key '{}': {error}",
+                    key_path.display()
+                ))
+            })?
+            .ok_or_else(|| {
+                SecretSpecError::ProviderOperationFailed(format!(
+                    "OpenBao client key '{}' contains no private key",
+                    key_path.display()
+                ))
+            })?;
+        Ok(Some((certificates, key)))
+    }
+}
+
+/// Verifies normal WebPKI trust before requiring the leaf certificate's SPKI
+/// to match the configured SHA-256 digest.
+#[cfg(feature = "openbao")]
+#[derive(Debug)]
+struct SpkiPinVerifier {
+    verifier: Arc<WebPkiServerVerifier>,
+    pin: Vec<u8>,
+}
+
+#[cfg(feature = "openbao")]
+impl ServerCertVerifier for SpkiPinVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: UnixTime,
+    ) -> std::result::Result<ServerCertVerified, rustls::Error> {
+        self.verifier.verify_server_cert(
+            end_entity,
+            intermediates,
+            server_name,
+            ocsp_response,
+            now,
+        )?;
+        validate_spki_pin(end_entity.as_ref(), &self.pin).map_err(rustls::Error::General)?;
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+        self.verifier.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+        self.verifier.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.verifier.supported_verify_schemes()
+    }
+}
+
+#[cfg(feature = "openbao")]
+fn validate_spki_pin(certificate: &[u8], expected_pin: &[u8]) -> std::result::Result<(), String> {
+    let (_, certificate) = x509_parser::certificate::X509Certificate::from_der(certificate)
+        .map_err(|error| format!("OpenBao server certificate is malformed: {error}"))?;
+    let actual_pin = Sha256::digest(certificate.tbs_certificate.subject_pki.raw);
+    if actual_pin.as_slice() != expected_pin {
+        return Err("OpenBao server SPKI does not match the configured `spki_pin`".to_string());
+    }
+    Ok(())
+}
 
 /// Stable runtime for the shared Vault-compatible HTTP connection pools.
 ///
@@ -201,6 +449,9 @@ pub(crate) struct KvConfig {
     pub(crate) role: Option<String>,
     /// Audience requested when SecretSpec mints a CI OIDC token.
     pub(crate) audience: Option<String>,
+    /// OpenBao TLS trust, pinning, and client-identity settings.
+    #[cfg(feature = "openbao")]
+    tls: OpenBaoTlsConfig,
 }
 
 impl Default for KvConfig {
@@ -214,6 +465,8 @@ impl Default for KvConfig {
             auth_mount: None,
             role: None,
             audience: None,
+            #[cfg(feature = "openbao")]
+            tls: OpenBaoTlsConfig::default(),
         }
     }
 }
@@ -285,6 +538,13 @@ impl KvConfig {
             .map(|(_, value)| value != "false" && value != "0")
             .unwrap_or(true);
         let http_scheme = if use_tls { "https" } else { "http" };
+
+        #[cfg(feature = "openbao")]
+        let tls = if product == Product::OpenBao {
+            OpenBaoTlsConfig::parse(url, use_tls)?
+        } else {
+            OpenBaoTlsConfig::default()
+        };
 
         // An explicit host wins. A scheme-only URI is useful in CI and falls
         // back through the product's conventional address variables.
@@ -402,6 +662,8 @@ impl KvConfig {
             auth_mount,
             role,
             audience,
+            #[cfg(feature = "openbao")]
+            tls,
         })
     }
 
@@ -445,7 +707,7 @@ pub(crate) struct KvProvider {
     /// each. Behind reverse proxies that has been observed to drop part of the
     /// burst (`Failed to connect to Vault`). One client per provider keeps the
     /// pool warm across those concurrent gets.
-    http: OnceLock<reqwest::Client>,
+    http: OnceLock<std::result::Result<reqwest::Client, String>>,
 }
 
 /// Number of authenticated requests an issued login token can still serve.
@@ -574,9 +836,115 @@ impl KvProvider {
         }
     }
 
+    /// Builds the shared HTTP client with OpenBao's optional TLS extensions.
+    fn build_http_client(&self) -> Result<reqwest::Client> {
+        #[cfg(feature = "openbao")]
+        if self.product == Product::OpenBao && self.config.tls.spki_pin.is_some() {
+            return self.build_pinned_http_client();
+        }
+
+        let builder = reqwest::Client::builder();
+        #[cfg(feature = "openbao")]
+        let mut builder = builder;
+        #[cfg(feature = "openbao")]
+        if self.product == Product::OpenBao {
+            if let Some(ca_pem) = self.config.tls.ca_pem()? {
+                let certificate = reqwest::Certificate::from_pem(&ca_pem).map_err(|error| {
+                    SecretSpecError::ProviderOperationFailed(format!(
+                        "Failed to parse OpenBao CA certificate: {}",
+                        crate::error::display_error_chain(&error)
+                    ))
+                })?;
+                builder = builder.add_root_certificate(certificate);
+            }
+            if let Some(identity_pem) = self.config.tls.client_identity_pem()? {
+                let identity = reqwest::Identity::from_pem(&identity_pem).map_err(|error| {
+                    SecretSpecError::ProviderOperationFailed(format!(
+                        "Failed to configure OpenBao mTLS identity: {}",
+                        crate::error::display_error_chain(&error)
+                    ))
+                })?;
+                builder = builder.identity(identity);
+            }
+        }
+        builder.build().map_err(|error| {
+            SecretSpecError::ProviderOperationFailed(format!(
+                "Failed to build {} HTTP client: {}",
+                self.product.display_name(),
+                crate::error::display_error_chain(&error)
+            ))
+        })
+    }
+
+    /// Builds the pinned OpenBao client with system trust and optional custom
+    /// roots. Pin verification happens during the TLS handshake, before HTTP
+    /// headers or secret payloads can be transmitted.
+    #[cfg(feature = "openbao")]
+    fn build_pinned_http_client(&self) -> Result<reqwest::Client> {
+        let mut roots = RootCertStore::empty();
+        let native_roots = rustls_native_certs::load_native_certs();
+        if native_roots.certs.is_empty() {
+            return Err(SecretSpecError::ProviderOperationFailed(
+                "No system CA certificates are available for pinned OpenBao TLS".to_string(),
+            ));
+        }
+        roots.add_parsable_certificates(native_roots.certs);
+        if let Some(ca_pem) = self.config.tls.ca_pem()? {
+            let certificates = rustls_pemfile::certs(&mut BufReader::new(ca_pem.as_slice()))
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|error| {
+                    SecretSpecError::ProviderOperationFailed(format!(
+                        "Failed to parse OpenBao CA certificate: {error}"
+                    ))
+                })?;
+            if certificates.is_empty() {
+                return Err(SecretSpecError::ProviderOperationFailed(
+                    "OpenBao CA certificate contains no certificates".to_string(),
+                ));
+            }
+            roots.add_parsable_certificates(certificates);
+        }
+        let verifier = WebPkiServerVerifier::builder(Arc::new(roots))
+            .build()
+            .map_err(|error| {
+                SecretSpecError::ProviderOperationFailed(format!(
+                    "Failed to configure OpenBao TLS verifier: {error}"
+                ))
+            })?;
+        let pin = self.config.tls.spki_pin.clone().ok_or_else(|| {
+            SecretSpecError::ProviderOperationFailed("OpenBao SPKI pin is missing".to_string())
+        })?;
+        let config = ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(SpkiPinVerifier { verifier, pin }));
+        let config =
+            match self.config.tls.client_identity()? {
+                Some((certificates, key)) => config
+                    .with_client_auth_cert(certificates, key)
+                    .map_err(|error| {
+                        SecretSpecError::ProviderOperationFailed(format!(
+                            "Failed to configure OpenBao mTLS identity: {error}"
+                        ))
+                    })?,
+                None => config.with_no_client_auth(),
+            };
+        reqwest::Client::builder()
+            .use_preconfigured_tls(config)
+            .build()
+            .map_err(|error| {
+                SecretSpecError::ProviderOperationFailed(format!(
+                    "Failed to build OpenBao HTTP client: {}",
+                    crate::error::display_error_chain(&error)
+                ))
+            })
+    }
+
     /// The shared HTTP client.
-    fn http(&self) -> &reqwest::Client {
-        self.http.get_or_init(reqwest::Client::new)
+    fn http(&self) -> Result<&reqwest::Client> {
+        self.http
+            .get_or_init(|| self.build_http_client().map_err(|error| error.to_string()))
+            .as_ref()
+            .map_err(|error| SecretSpecError::ProviderOperationFailed(error.clone()))
     }
 
     /// Authenticates for the logical operation that owns the returned session.
@@ -1113,7 +1481,7 @@ impl KvProvider {
             }
         };
 
-        let mut request = self.http().get(&request_url).bearer_auth(&request_token);
+        let mut request = self.http()?.get(&request_url).bearer_auth(&request_token);
         if let Some(audience) = &self.config.audience {
             request = request.query(&[("audience", audience.as_str())]);
         }
@@ -1155,7 +1523,7 @@ impl KvProvider {
         body: &serde_json::Value,
     ) -> Result<reqwest::RequestBuilder> {
         Ok(self
-            .http()
+            .http()?
             .post(url)
             .headers(self.build_namespace_headers()?)
             .json(body))
@@ -1312,7 +1680,7 @@ impl KvProvider {
         let url = self.metadata_url(secret_path);
         let response = self
             .send_with_connect_retry(session, token, |token| {
-                Ok(self.http().get(&url).headers(self.build_headers(token)?))
+                Ok(self.http()?.get(&url).headers(self.build_headers(token)?))
             })
             .await?;
 
@@ -1351,7 +1719,7 @@ impl KvProvider {
         let response = self
             .send_with_connect_retry(session, token, |token| {
                 Ok(self
-                    .http()
+                    .http()?
                     .post(&url)
                     .headers(self.build_headers(token)?)
                     .json(&body))
@@ -1389,7 +1757,10 @@ impl KvProvider {
         };
         let response = self
             .send_with_connect_retry(session, token, |token| {
-                Ok(self.http().delete(&url).headers(self.build_headers(token)?))
+                Ok(self
+                    .http()?
+                    .delete(&url)
+                    .headers(self.build_headers(token)?))
             })
             .await?;
 
@@ -1427,7 +1798,7 @@ impl KvProvider {
         let url = self.build_url(secret_path);
         let response = self
             .send_with_connect_retry(session, token, |token| {
-                Ok(self.http().get(&url).headers(self.build_headers(token)?))
+                Ok(self.http()?.get(&url).headers(self.build_headers(token)?))
             })
             .await?;
 
@@ -1488,7 +1859,7 @@ impl KvProvider {
         let response = self
             .send_with_connect_retry(session, token, |token| {
                 Ok(self
-                    .http()
+                    .http()?
                     .post(&url)
                     .headers(self.build_headers(token)?)
                     .json(&body))
@@ -2236,6 +2607,103 @@ mod tests {
         assert_eq!(
             Product::OpenBao.jwt_audience_envs(),
             &["BAO_JWT_AUDIENCE", "VAULT_JWT_AUDIENCE"]
+        );
+    }
+
+    #[cfg(feature = "openbao")]
+    #[test]
+    fn openbao_tls_options_require_complete_and_secure_configuration() {
+        let pin = base64::engine::general_purpose::STANDARD.encode([7_u8; 32]);
+        let config = KvConfig::parse(
+            &provider_url(&format!(
+                "openbao://bao.example.com/secret?ca_cert_path=%2Fetc%2Fbao-ca.pem&spki_pin={pin}&client_cert_path=%2Fetc%2Fbao-client.pem&client_key_path=%2Fetc%2Fbao-client-key.pem"
+            )),
+            Product::OpenBao,
+        )
+        .unwrap();
+        assert_eq!(
+            config.tls.ca_cert_path,
+            Some(PathBuf::from("/etc/bao-ca.pem"))
+        );
+        assert_eq!(config.tls.spki_pin, Some(vec![7; 32]));
+        assert_eq!(
+            config.tls.client_key_path,
+            Some(PathBuf::from("/etc/bao-client-key.pem"))
+        );
+
+        let inline_ca = KvConfig::parse(
+            &provider_url("openbao://bao.example.com/secret?ca_cert_data=PEM%0ADATA"),
+            Product::OpenBao,
+        )
+        .unwrap();
+        assert_eq!(inline_ca.tls.ca_cert_pem.as_deref(), Some("PEM\nDATA"));
+
+        let plaintext = KvConfig::parse(
+            &provider_url("openbao://bao.example.com/secret?tls=false"),
+            Product::OpenBao,
+        )
+        .unwrap();
+        assert_eq!(plaintext.endpoint, "http://bao.example.com");
+
+        let duplicate_ca = KvConfig::parse(
+            &provider_url(
+                "openbao://bao.example.com/secret?ca_cert_path=%2Fetc%2Fca.pem&ca_cert_data=PEM",
+            ),
+            Product::OpenBao,
+        )
+        .unwrap_err();
+        assert!(duplicate_ca.to_string().contains("only one"));
+
+        let invalid_pin = KvConfig::parse(
+            &provider_url("openbao://bao.example.com/secret?spki_pin=not-base64"),
+            Product::OpenBao,
+        )
+        .unwrap_err();
+        assert!(invalid_pin.to_string().contains("base64-encoded SHA-256"));
+
+        let incomplete_identity = KvConfig::parse(
+            &provider_url("openbao://bao.example.com/secret?client_cert_path=%2Fetc%2Fclient.pem"),
+            Product::OpenBao,
+        )
+        .unwrap_err();
+        assert!(incomplete_identity.to_string().contains("requires both"));
+
+        let insecure_transport = KvConfig::parse(
+            &provider_url("openbao://bao.example.com/secret?tls=false&spki_pin=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="),
+            Product::OpenBao,
+        )
+        .unwrap_err();
+        assert!(insecure_transport.to_string().contains("require TLS"));
+    }
+
+    #[cfg(feature = "openbao")]
+    #[test]
+    fn openbao_spki_pin_matches_only_the_certificate_public_key() {
+        const CERTIFICATE: &[u8] = b"-----BEGIN CERTIFICATE-----\n\
+MIIBtjCCAVugAwIBAgITBmyf1XSXNmY/Owua2eiedgPySjAKBggqhkjOPQQDAjA5\n\
+MQswCQYDVQQGEwJVUzEPMA0GA1UEChMGQW1hem9uMRkwFwYDVQQDExBBbWF6b24g\n\
+Um9vdCBDQSAzMB4XDTE1MDUyNjAwMDAwMFoXDTQwMDUyNjAwMDAwMFowOTELMAkG\n\
+A1UEBhMCVVMxDzANBgNVBAoTBkFtYXpvbjEZMBcGA1UEAxMQQW1hem9uIFJvb3Qg\n\
+Q0EgMzBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABCmXp8ZBf8ANm+gBG1bG8lKl\n\
+ui2yEujSLtf6ycXYqm0fc4E7O5hrOXwzpcVOho6AF2hiRVd9RFgdszflZwjrZt6j\n\
+QjBAMA8GA1UdEwEB/wQFMAMBAf8wDgYDVR0PAQH/BAQDAgGGMB0GA1UdDgQWBBSr\n\
+ttvXBp43rDCGB5Fwx5zEGbF4wDAKBggqhkjOPQQDAgNJADBGAiEA4IWSoxe3jfkr\n\
+BqWTrBqYaGFy+uGh0PsceGCmQ5nFuMQCIQCcAu/xlJyzlvnrxir4tiz+OpAUFteM\n\
+YyRIHN8wfdVoOw==\n\
+-----END CERTIFICATE-----\n";
+        let certificate = rustls_pemfile::certs(&mut BufReader::new(CERTIFICATE))
+            .next()
+            .expect("fixture contains one certificate")
+            .expect("fixture certificate is valid");
+        let (_, parsed) = x509_parser::certificate::X509Certificate::from_der(certificate.as_ref())
+            .expect("fixture certificate parses");
+        let pin = Sha256::digest(parsed.tbs_certificate.subject_pki.raw).to_vec();
+
+        assert!(validate_spki_pin(certificate.as_ref(), &pin).is_ok());
+        assert!(
+            validate_spki_pin(certificate.as_ref(), &[0; 32])
+                .unwrap_err()
+                .contains("does not match")
         );
     }
 

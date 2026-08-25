@@ -37,6 +37,9 @@
 //! - `auth` -- `token` (default), `approle`, or `jwt`
 //! - `kv` -- KV engine version: `1` or `2` (default)
 //! - `tls` -- `true` (default) or `false`; the latter is intended for dev mode
+//! - `ca_cert_path` or `ca_cert_data` -- PEM custom CA from a file or URI data
+//! - `spki_pin` -- base64-encoded SHA-256 of the server certificate's SPKI
+//! - `client_cert_path` and `client_key_path` -- PEM client identity for mTLS
 //! - `auth_mount` -- non-default AppRole or JWT mount beneath `/v1/auth`
 //!   (SecretSpec 0.18+)
 //! - `role` -- role for JWT auth, falling back through `BAO_JWT_ROLE` and
