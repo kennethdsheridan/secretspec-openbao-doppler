@@ -69,6 +69,10 @@ rsa.workspace = true
 uuid.workspace = true
 data-encoding.workspace = true
 sha2.workspace = true
+rustls = { workspace = true, optional = true }
+rustls-native-certs = { workspace = true, optional = true }
+rustls-pemfile = { workspace = true, optional = true }
+x509-parser = { workspace = true, optional = true }
 detect-coding-agent.workspace = true
 age = { workspace = true, optional = true }
 kube = { workspace = true, optional = true }
@@ -93,7 +97,7 @@ vault = ["dep:reqwest", "tokio/sync"]
 # payloads use data-encoding, which is already a non-optional dependency.
 scaleway = ["dep:reqwest"]
 cloudflare = ["dep:reqwest"]
-openbao = ["dep:reqwest", "tokio/sync"]
+openbao = ["dep:reqwest", "dep:base64", "dep:rustls", "dep:rustls-native-certs", "dep:rustls-pemfile", "dep:x509-parser", "tokio/sync"]
 # `tokio/sync` for the async `OnceCell` that serializes the Universal Auth
 # exchange. It is already on transitively via reqwest, but a provider should
 # name the features it uses rather than inherit them from a sibling.
