@@ -39,15 +39,15 @@
           then pkgs.pkgsStatic.rustPlatform
           else pkgs.rustPlatform).buildRustPackage {
             pname = "secretspec";
-            version = "0.19.1";
+            version = "0.20.0";
             src = ./.;
             cargoLock.lockFile = ./Cargo.lock;
             cargoBuildFlags = [ "--package" "secretspec" ]
               ++ lib.optionals stdenv.hostPlatform.isLinux [
-                "--no-default-features"
-                "--features"
-                "cli,openbao"
-              ];
+              "--no-default-features"
+              "--features"
+              "cli,openbao"
+            ];
             cargoTestFlags = [ "--package" "secretspec" ];
 
             nativeBuildInputs = [ pkgs.makeWrapper ];
@@ -83,7 +83,7 @@
 
           secretspec-derive = pkgs.rustPlatform.buildRustPackage {
             pname = "secretspec-derive";
-            version = "0.19.1";
+            version = "0.20.0";
             src = ./.;
             cargoLock.lockFile = ./Cargo.lock;
             cargoBuildFlags = [ "--package" "secretspec-derive" ];
