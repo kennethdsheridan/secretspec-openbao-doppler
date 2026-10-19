@@ -56,7 +56,7 @@ jobs:
             /usr/local/share/boost /usr/local/share/powershell
           sudo docker image prune --all --force
           df -h /
-      - uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31.11.0
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
       - uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71 # v17
         with:
           name: devenv
@@ -113,13 +113,13 @@ jobs:
       # MINGW64 (msvcrt-based) matches the CRT the x86_64-pc-windows-gnu Rust
       # target links, so every object in the archive agrees on one C runtime.
       - name: Install MSYS2 MinGW toolchain (compiles the staticlib's C deps)
-        uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2.32.0
+        uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2.33.0
         with:
           msystem: MINGW64
           path-type: inherit
           install: mingw-w64-x86_64-gcc mingw-w64-x86_64-binutils
       - name: Install GHC and cabal
-        uses: haskell-actions/setup@6037f33647c3f17758a2356c80fc4a53d7e0685d # v2.12.0
+        uses: haskell-actions/setup@0f8e8c99d88aeb3fbfd523f1ef2c6f762d10d64d # v2.12.1
         with:
           ghc-version: "9.6"
       - name: Build staticlib + CLI and run the Haskell SDK test-suite
@@ -203,7 +203,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Sync SDK package versions
         run: bash scripts/sync-sdk-versions.sh
-      - uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31.11.0
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
       - uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71 # v17
         with:
           name: devenv
